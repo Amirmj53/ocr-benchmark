@@ -1,0 +1,22 @@
+[project]
+name = "ocr-benchmark"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Muhammadjavad", email = "jonsonmicel78@gmail.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "onnxruntime>=1.30.0",
+    "paddleocr>=3.7.0",
+    "pymupdf>=1.28.2",
+    "rapidocr>=3.9.2",
+]
+
+[project.scripts]
+ocr-benchmark = "ocr_benchmark:main"
+
+[build-system]
+requires = ["uv_build>=0.12.13,<0.13.0"]
+build-backend = "uv_build"
