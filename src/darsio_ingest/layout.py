@@ -1,9 +1,15 @@
 """Layout analysis.
 
-Turns raw OCR blocks into structured page content:
+Turns raw OCR blocks (or extracted PDF text lines) into structured page
+content:
+
     blocks -> lines (RTL order) -> columns (RTL reading order) -> regions
     (title/heading/body/special/noise) -> paragraphs, plus cross-page
     header/footer/watermark removal based on text repetition.
+
+All geometry is handled in a single consistent unit per page (pixels for
+the OCR path, points for the text path); every scale-sensitive comparison
+is relative (line width vs body width, height vs page median height).
 """
 
 from __future__ import annotations
@@ -11,8 +17,15 @@ from __future__ import annotations
 import re
 from collections import Counter
 
-from models import LineType, OCRBlock, OCRLine, PageResult, RegionRole, TextRegion
-from normalize import has_persian, persian_letter_ratio
+from darsio_ingest.models import (
+    LineType,
+    OCRBlock,
+    OCRLine,
+    PageResult,
+    RegionRole,
+    TextRegion,
+)
+from darsio_ingest.normalize import has_persian, persian_letter_ratio
 
 MIN_BLOCK_SCORE = 0.55  # blocks below this are dropped outright
 SPECIAL_MIN_SCORE = 0.30  # formula-like content is kept down to this score
@@ -37,7 +50,9 @@ def looks_like_formula(text: str) -> bool:
     compact = text.replace(" ", "").translate(PERSIAN_DIGIT_TRANS)
     if len(compact) > 60:
         return False
-    if re.fullmatch(r"[A-Za-z0-9+\-=→×·⇌()\[\]γδθλµ]{2,}", compact) and any(c.isdigit() for c in compact):
+    if re.fullmatch(r"[A-Za-z0-9+\-=→×·⇌()\[\]γδθλµ]{2,}", compact) and any(
+        c.isdigit() for c in compact
+    ):
         return True
     if re.search(r"[A-Z][a-z]?\d", compact) and re.search(r"[+\-=→⇌]", compact):
         return True
@@ -45,7 +60,7 @@ def looks_like_formula(text: str) -> bool:
 
 
 def looks_like_english_word(text: str) -> bool:
-    """Latin words like ACETIC, PHENOL, neutralization — real content."""
+    """Latin words like ACETIC, PHENOL, neutralization -- real content."""
     if not text:
         return False
     compact = "".join(text.split())
@@ -186,7 +201,9 @@ def group_into_lines(blocks: list[OCRBlock]) -> list[OCRLine]:
         # RTL reading order: rightmost block first. Persian strings inside
         # blocks are never reversed.
         line_blocks.sort(key=lambda b: b.center_x, reverse=True)
-        result.append(OCRLine(blocks=line_blocks, page_number=line_blocks[0].page_number))
+        result.append(
+            OCRLine(blocks=line_blocks, page_number=line_blocks[0].page_number)
+        )
     result.sort(key=lambda line: line.top)
     return result
 
@@ -208,15 +225,21 @@ def detect_column_count(lines: list[OCRLine], page_width: float) -> int:
     return 1
 
 
-def order_lines_reading_order(lines: list[OCRLine], page_width: float) -> tuple[list[OCRLine], int]:
+def order_lines_reading_order(
+    lines: list[OCRLine], page_width: float
+) -> tuple[list[OCRLine], int]:
     """RTL reading order: right column top-to-bottom, then left column."""
     column_count = detect_column_count(lines, page_width)
     if column_count == 1:
         return sorted(lines, key=lambda line: line.top), 1
 
     midpoint = page_width / 2
-    right_col = sorted((l for l in lines if l.center_x >= midpoint), key=lambda l: l.top)
-    left_col = sorted((l for l in lines if l.center_x < midpoint), key=lambda l: l.top)
+    right_col = sorted(
+        (l for l in lines if l.center_x >= midpoint), key=lambda l: l.top
+    )
+    left_col = sorted(
+        (l for l in lines if l.center_x < midpoint), key=lambda l: l.top
+    )
     return right_col + left_col, 2
 
 
@@ -285,7 +308,7 @@ def classify_line(
         "می شوند", "مى شوند", "مي شوند", "می‌شوند", "میشوند",
         "می باشند", "مى باشند", "میباشد", "می باشد", "ميباشد",
         "می گردد", "میگردد", "می گیرد", "میگیرد", "می آید", "میآید",
-        "می رود", "میرود", "می رود",
+        "می رود", "میرود",
         "دارد", "دارند", "است", "بود", "باشد", "شد", "شده است",
     )
     if text.rstrip().endswith(LIGHT_VERB_ENDINGS):
@@ -305,21 +328,30 @@ def classify_line(
 
     # Lines containing stray 1-2 char digit tokens ("زیاد 4 مقاومت") are
     # bullet/list merges from the layout, never titles.
-    if any(token.strip("().,") .isdigit() and len(token.strip("().,")) <= 2 for token in text.split()):
+    if any(
+        token.strip("().,").isdigit() and len(token.strip("().,")) <= 2
+        for token in text.split()
+    ):
         return LineType.BODY
 
     # Real headings have at least two words; single-word diagram labels
     # ("کمبر", "خالص") must not hijack the section path.
     if 2 <= word_count <= 8:
         short_relative_to_page = (
-            line.width < 0.5 * body_width_hint if body_width_hint else line.width < 300
+            line.width < 0.5 * body_width_hint
+            if body_width_hint
+            else line.width < 300
         )
         taller_than_body = (
             page_median_height is not None
             and line.height > page_median_height * 1.25
         )
         ends_without_punct = not text.rstrip().endswith((",", ".", "،", ";", ":"))
-        if short_relative_to_page and (taller_than_body or word_count <= 6) and ends_without_punct:
+        if (
+            short_relative_to_page
+            and (taller_than_body or word_count <= 6)
+            and ends_without_punct
+        ):
             return LineType.HEADING
 
     return LineType.BODY
@@ -337,6 +369,7 @@ def build_regions(
     lines: list[OCRLine],
     page_median_height: float | None = None,
     page_height: float | None = None,
+    source_method: str = "ocr",
 ) -> list[TextRegion]:
     """Group ordered lines into regions: heading, body paragraphs, specials."""
     if not lines:
@@ -357,6 +390,7 @@ def build_regions(
                     role=RegionRole.BODY,
                     lines=current_body,
                     page_number=current_body[0].page_number,
+                    source_method=source_method,
                 )
             )
             current_body = []
@@ -369,6 +403,7 @@ def build_regions(
                     role=RegionRole.HEADING,
                     lines=[current_heading],
                     page_number=current_heading.page_number,
+                    source_method=source_method,
                 )
             )
             current_heading = None
@@ -383,6 +418,7 @@ def build_regions(
                     role=RegionRole.SPECIAL,
                     lines=current_special,
                     page_number=current_special[0].page_number,
+                    source_method=source_method,
                 )
             )
             current_special = []
@@ -413,15 +449,16 @@ def build_regions(
             flush_heading()
             # Adjacent special lines merge into one region so poster
             # fragments become one chunk, not six.
-            if current_special and line_gap(current_special[-1], line) > 3.0 * page_median_height:
+            if current_special and line_gap(
+                current_special[-1], line
+            ) > 3.0 * page_median_height:
                 flush_special()
             current_special.append(line)
             continue
 
         flush_special()
 
-        # BODY line: start new paragraph after a big vertical gap or after
-        # an indented first line (typical Persian paragraph indent).
+        # BODY line: start new paragraph after a big vertical gap.
         if current_body:
             previous = current_body[-1]
             gap = line_gap(previous, line)
@@ -479,6 +516,8 @@ def build_page_result(
     height: float,
     blocks: list[OCRBlock],
     debug_keep_noise: bool = False,
+    source_method: str = "ocr",
+    status: str = "",
 ) -> PageResult:
     """Assemble one page: filter -> lines -> reading order -> regions."""
     kept_blocks: list[OCRBlock] = []
@@ -497,7 +536,9 @@ def build_page_result(
     lines = group_into_lines(kept_blocks)
     ordered_lines, column_count = order_lines_reading_order(lines, width)
 
-    regions = build_regions(ordered_lines, page_height=height)
+    regions = build_regions(
+        ordered_lines, page_height=height, source_method=source_method
+    )
     annotate_headings(regions)
 
     # Column index per region (0 = single column).
@@ -512,8 +553,14 @@ def build_page_result(
         lines=ordered_lines,
         regions=regions,
         column_count=column_count,
-        headings=[r.text for r in regions if r.role in (RegionRole.HEADING, RegionRole.TITLE)],
+        headings=[
+            r.text
+            for r in regions
+            if r.role in (RegionRole.HEADING, RegionRole.TITLE)
+        ],
         text="\n\n".join(r.text for r in regions if r.text),
+        source_method=source_method,
+        status=status,
     )
     return page
 
@@ -529,7 +576,11 @@ def find_repeated_texts(pages: list[PageResult], min_ratio: float = 0.6) -> set[
 
     counts: Counter = Counter()
     for page in pages:
-        seen = {line.text.strip() for line in page.lines if len(line.text.strip()) >= 3}
+        seen = {
+            line.text.strip()
+            for line in page.lines
+            if len(line.text.strip()) >= 3
+        }
         for text in seen:
             counts[text] += 1
 
@@ -544,48 +595,18 @@ def strip_repeated_content(pages: list[PageResult]) -> set[str]:
         return repeated
 
     for page in pages:
-        page.lines = [line for line in page.lines if line.text.strip() not in repeated]
+        page.lines = [
+            line for line in page.lines if line.text.strip() not in repeated
+        ]
         for region in page.regions:
-            region.lines = [line for line in region.lines if line.text.strip() not in repeated]
+            region.lines = [
+                line for line in region.lines if line.text.strip() not in repeated
+            ]
         page.regions = [r for r in page.regions if r.lines]
         page.text = "\n\n".join(r.text for r in page.regions if r.text)
-        page.headings = [r.text for r in page.regions if r.role in (RegionRole.HEADING, RegionRole.TITLE)]
+        page.headings = [
+            r.text
+            for r in page.regions
+            if r.role in (RegionRole.HEADING, RegionRole.TITLE)
+        ]
     return repeated
-
-
-# Backwards-compatible names used by the old test scripts.
-def extract_blocks(result, page_height: float | None = None) -> list[OCRBlock]:
-    """Convert a raw RapidOCR result object to OCRBlocks (legacy helper)."""
-    blocks: list[OCRBlock] = []
-    if result is None or result.boxes is None:
-        return blocks
-    for box, text, score in zip(result.boxes, result.txts, result.scores):
-        xs = [float(p[0]) for p in box]
-        ys = [float(p[1]) for p in box]
-        blocks.append(
-            OCRBlock(
-                text=str(text).strip(),
-                score=float(score),
-                left=min(xs),
-                top=min(ys),
-                right=max(xs),
-                bottom=max(ys),
-            )
-        )
-    return blocks
-
-
-def group_into_paragraphs(lines: list[OCRLine]) -> list[list[OCRLine]]:
-    """Legacy: group lines into paragraph lists."""
-    regions = build_regions(lines)
-    return [region.lines for region in regions]
-
-
-def paragraphs_to_text(paragraphs: list[list[OCRLine]]) -> str:
-    """Legacy: render paragraph groups as text."""
-    parts = []
-    for paragraph in paragraphs:
-        text = " ".join(line.text for line in paragraph).strip()
-        if text:
-            parts.append(text)
-    return "\n\n".join(parts)

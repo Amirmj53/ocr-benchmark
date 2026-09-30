@@ -1,9 +1,10 @@
 """Optional image preprocessing.
 
-Kept minimal and conservative: for clean scanned pages, preprocessing
-helps detection recall; for already-clean pages it can hurt recognition.
-The pipeline defaults to grayscale+contrast — measured neutral-to-positive
-on the benchmark — and never crops or destroys content.
+A/B finding on the benchmark document (13-page scanned chemistry pamphlet,
+2026-09): raw color images BEAT grayscale/contrast/sharpen -- preprocessing
+destroyed a real content line, produced letter-spam, and was slower.
+Preprocessing therefore defaults to OFF everywhere; keep it off unless you
+have re-run the A/B on your own corpus and documented a win.
 """
 
 from __future__ import annotations
@@ -13,10 +14,10 @@ from PIL import Image, ImageEnhance, ImageFilter
 
 def preprocess_image(
     image: Image.Image,
+    grayscale: bool = False,
+    contrast: float = 1.0,
+    sharpen: bool = False,
     scale: float = 1.0,
-    contrast: float = 1.12,
-    sharpen: bool = True,
-    grayscale: bool = True,
 ) -> Image.Image:
     image = image.convert("L") if grayscale else image.convert("RGB")
 

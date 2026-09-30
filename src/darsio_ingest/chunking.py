@@ -8,14 +8,27 @@ Chunks follow document structure instead of slicing characters:
   ``!``), never mid-word;
 * tiny remnants are merged forward so we never emit fragment chunks;
 * every chunk carries document_id, page_start/page_end, section/heading,
-  section_path, chunk_index, geometry and OCR confidence.
+  section_path, chunk_index, geometry, confidence and source provenance
+  (source_method, engine_version, normalized).
+
+Default policy: chunks do NOT span pages (pamphlets / slide-like handouts);
+pass merge_across_pages=True for flowing textbooks. Chunks inherit
+source_method from their regions, so in mixed documents each chunk honestly
+records whether it came from the text path or the OCR path.
 """
 
 from __future__ import annotations
 
 import re
 
-from models import Chunk, ChunkType, DocumentResult, RegionRole, TextRegion
+from darsio_ingest.api_types import ENGINE_VERSION
+from darsio_ingest.models import (
+    Chunk,
+    ChunkType,
+    DocumentResult,
+    RegionRole,
+    TextRegion,
+)
 
 MIN_CHUNK_CHARS = 80
 MAX_CHUNK_CHARS = 900
@@ -74,18 +87,20 @@ def _pieces_to_chunks(
     bbox: list[float] | None,
     score: float,
     start_index: int,
+    source_method: str = "ocr",
     min_chars: int = MIN_CHUNK_CHARS,
     max_chars: int = MAX_CHUNK_CHARS,
 ) -> list[Chunk]:
     """Pack pieces into chunks, merging tiny ones with the previous piece."""
     merged: list[str] = []
     for piece in pieces:
-        if merged and len(merged[-1]) < min_chars:
-            combined = f"{merged[-1]} {piece}"
-            if len(combined) <= max_chars:
-                merged[-1] = combined
-                continue
-        merged.append(piece)
+        for sub_piece in _split_paragraph(piece, max_chars):
+            if merged and len(merged[-1]) < min_chars:
+                combined = f"{merged[-1]} {sub_piece}"
+                if len(combined) <= max_chars:
+                    merged[-1] = combined
+                    continue
+            merged.append(sub_piece)
 
     result: list[Chunk] = []
     for offset, text in enumerate(merged):
@@ -103,6 +118,9 @@ def _pieces_to_chunks(
                 bbox=bbox,
                 score=score,
                 char_count=len(text),
+                source_method=source_method,
+                engine_version=ENGINE_VERSION,
+                normalized=True,
             )
         )
     return result
@@ -116,17 +134,22 @@ def chunk_regions(
     max_chars: int = MAX_CHUNK_CHARS,
     merge_across_pages: bool = False,
     reset_sections_per_page: bool = True,
+    default_source_method: str = "ocr",
 ) -> list[Chunk]:
     """Chunk a flat list of regions (single page or multi-page stream).
 
-    Headings start sections; body paragraphs accumulate; long paragraphs are
-    split at sentence boundaries; tiny remnants merge forward.
+    Headings start sections; body paragraphs accumulate; long paragraphs
+    are split at sentence boundaries; tiny remnants merge forward.
 
     merge_across_pages=False flushes at every page boundary (the right
     default for slide-like pages where each page covers its own topic); set
     True for flowing textbooks so paragraphs cut by a page break reunite.
     reset_sections_per_page=True clears page-local diagram/caption sections
     at page starts so they cannot leak into later pages.
+
+    Each chunk's source_method is the method of its first region (a chunk
+    never mixes methods because buffers flush at page boundaries when
+    merge_across_pages=False, and a single page uses a single method).
     """
     chunks: list[Chunk] = []
     section_path: list[str] = []
@@ -139,10 +162,13 @@ def chunk_regions(
     buffer_bboxes: dict[int, list[float]] = {}
     buffer_scores: list[float] = []
     buffer_last_page = 0
+    buffer_source_method = default_source_method
     pending_special: list[str] | None = None
     pending_special_pages: list[int] = []
     pending_special_scores: list[float] = []
+    pending_special_method = default_source_method
     pending_heading_score = 0.0
+    pending_heading_method = default_source_method
 
     def buffer_bbox() -> list[float] | None:
         if not buffer_bboxes:
@@ -156,6 +182,7 @@ def chunk_regions(
 
     def emit_pending_specials() -> None:
         nonlocal pending_special, pending_special_pages, pending_special_scores
+        nonlocal pending_special_method
         if not pending_special:
             return
         chunks.extend(
@@ -174,6 +201,7 @@ def chunk_regions(
                     else 0.0
                 ),
                 start_index=len(chunks),
+                source_method=pending_special_method,
                 min_chars=min_chars,
                 max_chars=max_chars,
             )
@@ -181,11 +209,12 @@ def chunk_regions(
         pending_special = None
         pending_special_pages = []
         pending_special_scores = []
+        pending_special_method = default_source_method
 
     def flush_buffer() -> None:
         nonlocal pieces_buffer, buffer_page_start, buffer_page_end
         nonlocal buffer_bboxes, buffer_scores, pending_heading, pending_heading_page
-        nonlocal pending_heading_score
+        nonlocal pending_heading_score, pending_heading_method
         if not pieces_buffer:
             # A heading that never received body text is still content:
             # emit it as a heading chunk instead of dropping it. Pending
@@ -203,6 +232,7 @@ def chunk_regions(
                         bbox=None,
                         score=pending_heading_score,
                         start_index=len(chunks),
+                        source_method=pending_heading_method,
                         min_chars=min_chars,
                         max_chars=max_chars,
                     )
@@ -210,6 +240,7 @@ def chunk_regions(
                 pending_heading = None
                 pending_heading_page = 0
                 pending_heading_score = 0.0
+                pending_heading_method = default_source_method
             return
 
         text = " ".join(pieces_buffer).strip()
@@ -230,8 +261,11 @@ def chunk_regions(
                 page_start=buffer_page_start,
                 page_end=buffer_page_end,
                 bbox=buffer_bbox(),
-                score=sum(buffer_scores) / len(buffer_scores) if buffer_scores else 0.0,
+                score=(
+                    sum(buffer_scores) / len(buffer_scores) if buffer_scores else 0.0
+                ),
                 start_index=len(chunks),
+                source_method=buffer_source_method,
                 min_chars=min_chars,
                 max_chars=max_chars,
             )
@@ -245,14 +279,16 @@ def chunk_regions(
         pending_heading = None
         pending_heading_page = 0
         pending_heading_score = 0.0
+        pending_heading_method = default_source_method
 
     def add_region_to_buffer(region: TextRegion) -> None:
-        nonlocal buffer_page_start, buffer_page_end
+        nonlocal buffer_page_start, buffer_page_end, buffer_source_method
         text = region.text.strip()
         if not text:
             return
         if not pieces_buffer:
             buffer_page_start = region.page_number
+            buffer_source_method = region.source_method
         buffer_page_end = max(buffer_page_end, region.page_number)
         pieces_buffer.append(text)
         union = [region.left, region.top, region.right, region.bottom]
@@ -286,6 +322,7 @@ def chunk_regions(
             pending_heading = region.text
             pending_heading_page = region.page_number
             pending_heading_score = region.mean_score
+            pending_heading_method = region.source_method
             # Repeated headings (running titles across pages) never grow the
             # path; new ones cap the path at 3 levels.
             if region.text in section_path:
@@ -300,7 +337,7 @@ def chunk_regions(
             # better with their surrounding paragraph) but never start one.
             if pieces_buffer:
                 projected = sum(len(p) for p in pieces_buffer) + len(region.text) + 1
-                if projected <= max_chars:
+                if projected <= max_chars and region.source_method == buffer_source_method:
                     add_region_to_buffer(region)
                     continue
             flush_buffer()
@@ -320,6 +357,7 @@ def chunk_regions(
                 pending_special = [region.text]
                 pending_special_pages = [region.page_number]
                 pending_special_scores = [region.mean_score]
+                pending_special_method = region.source_method
             pending_heading = None
             continue
 
@@ -346,12 +384,22 @@ def chunk_regions(
     return chunks
 
 
-def chunk_document(document: DocumentResult) -> list[Chunk]:
+def chunk_document(
+    document: DocumentResult,
+    *,
+    merge_across_pages: bool = False,
+    reset_sections_per_page: bool = True,
+) -> list[Chunk]:
     """Chunk a full DocumentResult: regions across all pages in reading order."""
     all_regions: list[TextRegion] = []
     for page in document.pages:
         all_regions.extend(page.regions)
-    return chunk_regions(document.metadata.document_id, all_regions)
+    return chunk_regions(
+        document.metadata.document_id,
+        all_regions,
+        merge_across_pages=merge_across_pages,
+        reset_sections_per_page=reset_sections_per_page,
+    )
 
 
 def build_chunks(document: DocumentResult) -> DocumentResult:

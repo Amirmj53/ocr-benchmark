@@ -1,7 +1,7 @@
 [project]
-name = "ocr-benchmark"
-version = "0.1.0"
-description = "Add your description here"
+name = "darsio-ingest"
+version = "0.2.0"
+description = "Darsio document-ingestion engine: diagnose, text extraction, RapidOCR, layout, Persian normalization, chunking, prompt builders."
 readme = "README.md"
 authors = [
     { name = "Muhammadjavad", email = "jonsonmicel78@gmail.com" }
@@ -9,14 +9,24 @@ authors = [
 requires-python = ">=3.14"
 dependencies = [
     "onnxruntime>=1.30.0",
-    "paddleocr>=3.7.0",
+    "opencv-python>=4.10.0",
+    "pillow>=11.0.0",
     "pymupdf>=1.28.2",
+    "python-bidi>=0.6.0",
     "rapidocr>=3.9.2",
 ]
 
 [project.scripts]
-ocr-benchmark = "ocr_benchmark:main"
+darsio-ingest = "darsio_ingest.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+]
 
 [build-system]
 requires = ["uv_build>=0.12.13,<0.13.0"]
 build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "darsio_ingest"

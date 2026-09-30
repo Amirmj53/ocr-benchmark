@@ -1,4 +1,4 @@
-"""Shared data model for the Darsio OCR pipeline.
+"""Shared data models for the Darsio ingestion engine.
 
 Every artifact keeps its geometry and provenance so downstream systems
 (embeddings, RAG, citations) can always trace a piece of text back to its
@@ -120,7 +120,7 @@ class OCRLine:
     def text(self) -> str:
         """RTL line text: blocks ordered right-to-left, joined with spaces.
 
-        Persian strings themselves are never reversed — only the order of
+        Persian strings themselves are never reversed -- only the order of
         the blocks (visual order) is mapped to logical reading order.
         """
         return " ".join(b.text for b in self.blocks).strip()
@@ -156,6 +156,7 @@ class TextRegion:
     page_number: int = 0
     column: int = 0
     heading_text: str | None = None  # nearest preceding heading, if any
+    source_method: str = "ocr"  # "ocr" | "text" -- provenance for chunking
 
     @property
     def left(self) -> float:
@@ -209,7 +210,7 @@ class TextRegion:
 
 @dataclass
 class PageResult:
-    """Structured output for one rendered PDF page."""
+    """Structured output for one processed PDF page (either path)."""
 
     page_number: int  # 1-based
     width: float = 0.0
@@ -220,6 +221,8 @@ class PageResult:
     column_count: int = 1
     headings: list[str] = field(default_factory=list)
     text: str = ""  # normalized full-page text (paragraphs separated by \n\n)
+    source_method: str = "ocr"  # "ocr" | "text"
+    status: str = ""  # PageStatus value from diagnose
 
     def to_dict(self, include_blocks: bool = False) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -229,6 +232,8 @@ class PageResult:
             "headings": self.headings,
             "regions": [r.to_dict() for r in self.regions],
             "text": self.text,
+            "source_method": self.source_method,
+            "status": self.status,
         }
         if include_blocks:
             data["blocks"] = [b.to_dict() for b in self.blocks]
@@ -242,6 +247,7 @@ class DocumentMetadata:
     title: str | None = None
     author: str | None = None
     page_count: int = 0
+    checksum_sha256: str = ""
     parser: str = "ocr"
     ocr_model: str = "rapidocr-ppocrv5-arabic-mobile"
     extra: dict[str, Any] = field(default_factory=dict)
@@ -253,6 +259,7 @@ class DocumentMetadata:
             "title": self.title,
             "author": self.author,
             "page_count": self.page_count,
+            "checksum_sha256": self.checksum_sha256,
             "parser": self.parser,
             "ocr_model": self.ocr_model,
             **self.extra,
@@ -261,7 +268,7 @@ class DocumentMetadata:
 
 @dataclass
 class Chunk:
-    """A retrieval-ready chunk with full provenance metadata."""
+    """A retrieval-ready chunk with full provenance metadata (stable RAG schema)."""
 
     chunk_id: str
     document_id: str
@@ -274,9 +281,13 @@ class Chunk:
     section_path: list[str] = field(default_factory=list)
     bbox: list[float] | None = None  # union bbox of chunk content (top-level pages)
     page_bboxes: dict[str, list[float]] | None = None  # {"3": [l,t,r,b]}
-    score: float = 0.0  # mean OCR confidence
+    score: float = 0.0  # mean OCR confidence (0.0-1.0 for the text path)
     language: str = "fa"
     char_count: int = 0
+    # Provenance (v0.2 fields -- part of the Darsio contract):
+    source_method: str = "ocr"  # "ocr" | "text"
+    engine_version: str = "0.2.0"
+    normalized: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -294,6 +305,9 @@ class Chunk:
             "score": round(self.score, 4),
             "language": self.language,
             "char_count": self.char_count,
+            "source_method": self.source_method,
+            "engine_version": self.engine_version,
+            "normalized": self.normalized,
         }
 
 
@@ -304,10 +318,12 @@ class DocumentResult:
     metadata: DocumentMetadata
     pages: list[PageResult] = field(default_factory=list)
     chunks: list[Chunk] = field(default_factory=list)
+    method_per_page: dict[int, str] = field(default_factory=dict)
 
     def to_dict(self, include_blocks: bool = False) -> dict[str, Any]:
         return {
             "metadata": self.metadata.to_dict(),
             "pages": [p.to_dict(include_blocks=include_blocks) for p in self.pages],
             "chunks": [c.to_dict() for c in self.chunks],
+            "method_per_page": {str(k): v for k, v in self.method_per_page.items()},
         }

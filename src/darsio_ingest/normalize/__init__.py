@@ -1,7 +1,7 @@
 """Careful Persian text normalization.
 
 Design rule: normalize *form*, never *content*.
-Everything here is reversible-ish or purely cosmetic — we never delete
+Everything here is reversible-ish or purely cosmetic -- we never delete
 alphanumeric content, never fold away digits, and never reorder text.
 Aggressive cleaning (noise removal) belongs to layout.py, where geometry
 and confidence are still available.
@@ -19,7 +19,8 @@ LETTER_FOLD = {
     "\u0643": "\u06a9",  # ك -> ک
 }
 
-# Optional folds that only apply in *Arabic-context* words, see below.
+# Optional folds that only apply in *Arabic-context* words (Arabic loanwords
+# in educational Persian content); standard practice for Persian search.
 ARABIC_CONTEXT_FOLD = {
     "أ": "ا",
     "إ": "ا",
@@ -31,8 +32,13 @@ ARABIC_CONTEXT_FOLD = {
 
 # Diacritics (harakat) and tatweel are stripped: they carry no meaning for
 # search/embeddings and hurt tokenization. Quranic annotation signs (06D6-06DC
-# etc.) are kept — removing them could damage religious content.
+# etc.) are kept -- removing them could damage religious content.
 DIACRITICS_RE = re.compile(r"[\u064b-\u065f\u0670]")
+
+# Arabic presentation forms (FB50-FDFF) and Arabic presentation forms-B
+# (FE70-FEFF). Many Persian PDF generators store text in these compatibility
+# forms; they fold to standard letters below (per-char NFKC, content-safe).
+PRESENTATION_FORM_RE = re.compile(r"[\uFB50-\uFDFF\uFE70-\uFEFF]")
 
 # Zero-width characters. ZWNJ (\u200c) is *meaningful* in Persian
 # (می‌روم, کتاب‌ها) and is preserved. Everything else is dropped.
@@ -47,22 +53,17 @@ DIGIT_TABLE = str.maketrans({
 })
 
 PUNCT_NORM = {
-    "،": ",",  # keep as-is? no: fold Arabic comma to ASCII comma for embeddings
-    "؛": ";",
-    "؟": "?",
-    "٬": ",",
-    "٫": ".",  # decimal separator
+    "\u060c": ",",  # Arabic comma
+    "\u061b": ";",
+    "\u061f": "?",
+    "\u066c": ",",
+    "\u066b": ".",  # decimal separator
 }
 
 SPACE_RE = re.compile(r"[ \t\u00a0\u2000-\u200a]+")
 
 # Space before punctuation is noise (OCR artifact).
-SPACE_BEFORE_PUNCT_RE = re.compile(r"\s+([،؛,:.!؟\.\!])")
-
-# Arabic-context fold: ة/أ/إ etc. appear in Arabic loanwords; folding them is
-# standard practice for Persian search (see Persian-OCR-App) and does not
-# change meaning in educational content.
-ARABIC_CHARS_CLASS = "أإؤئةۀ"
+SPACE_BEFORE_PUNCT_RE = re.compile(r"\s+([\u060c\u061b,:.!\u061f\.!])")
 
 
 def normalize_text(text: str) -> str:
@@ -73,6 +74,17 @@ def normalize_text(text: str) -> str:
     # 1) Unicode NFC: compose decomposed forms (e.g. heh + hamza above).
     text = unicodedata.normalize("NFC", text)
 
+    # 1b) Fold Arabic presentation forms to standard letters. Applied
+    # per-char so NFKC's other compatibility changes never touch the rest
+    # of the string. This is a form change, not a content change.
+    if PRESENTATION_FORM_RE.search(text):
+        text = "".join(
+            unicodedata.normalize("NFKC", ch)
+            if PRESENTATION_FORM_RE.match(ch)
+            else ch
+            for ch in text
+        )
+
     # 2) Remove zero-width marks except ZWNJ.
     text = ZERO_WIDTH_RE.sub("", text)
 
@@ -80,7 +92,7 @@ def normalize_text(text: str) -> str:
     for old, new in LETTER_FOLD.items():
         text = text.replace(old, new)
 
-    # 4) Fold Arabic-only characters (ة, أ, ...) — safe for Persian content.
+    # 4) Fold Arabic-only characters (ة, أ, ...) -- safe for Persian content.
     for old, new in ARABIC_CONTEXT_FOLD.items():
         text = text.replace(old, new)
 
@@ -105,7 +117,7 @@ def normalize_text(text: str) -> str:
 
 
 def normalize_lines(lines: list[str]) -> list[str]:
-    """Normalize each line, keeping empty-line structure out."""
+    """Normalize each line, dropping empty results."""
     out = []
     for line in lines:
         n = normalize_text(line)
@@ -114,12 +126,27 @@ def normalize_lines(lines: list[str]) -> list[str]:
     return out
 
 
+def is_persian_char(ch: str) -> bool:
+    """Persian/Arabic script, including Arabic presentation forms.
+
+    Many Persian PDF generators (pymupdf's HTML writer among them) store
+    text as presentation forms (FB50-FDFF); those count as Persian.
+    """
+    code = ord(ch)
+    return (
+        0x0600 <= code <= 0x06FF
+        or 0x0750 <= code <= 0x077F
+        or 0xFB50 <= code <= 0xFDFF
+        or 0xFE70 <= code <= 0xFEFF
+    )
+
+
 def is_mostly_persian(text: str, threshold: float = 0.35) -> bool:
     """True if Persian/Arabic script dominates the alphanumeric content."""
     letters = [c for c in text if c.isalpha()]
     if not letters:
         return False
-    persian = sum(1 for c in letters if "\u0600" <= c <= "\u06ff")
+    persian = sum(1 for c in letters if is_persian_char(c))
     return persian / len(letters) >= threshold
 
 
@@ -127,11 +154,11 @@ def persian_letter_ratio(text: str) -> float:
     compact = "".join(text.split())
     if not compact:
         return 0.0
-    return sum(1 for c in compact if "\u0600" <= c <= "\u06ff") / len(compact)
+    return sum(1 for c in compact if is_persian_char(c)) / len(compact)
 
 
 def has_persian(text: str) -> bool:
-    return any("\u0600" <= c <= "\u06ff" for c in text)
+    return any(is_persian_char(c) for c in text)
 
 
 # Backwards-compatible alias (old test scripts import this name).

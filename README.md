@@ -1,108 +1,135 @@
-# Darsio OCR Pipeline (درسیو)
+# darsio-ingest
 
-PDF → render → RapidOCR (PP-OCRv5 Arabic) → layout analysis → Persian
-normalization → structure-aware chunking → retrieval-ready JSON/JSONL.
+The document-ingestion engine for
+[Darsio](https://github.com/Amirmj53/Darsio): diagnose a PDF, extract the
+text layer when it is healthy, OCR only the pages that need it (RapidOCR
+PP-OCRv5 Arabic mobile, ONNX Runtime), analyze layout, normalize Persian
+conservatively, and emit structure-aware, page-cited chunks ready for RAG.
+Also ships the prompt builders for Darsio's three study modes.
 
 Designed for real Persian educational PDFs (scanned pamphlets, 100+ pages)
-and built as the ingestion foundation for search, embeddings, RAG, question
-generation and page-cited answers in Darsio.
+under a hard economic constraint: never OCR a whole book by default.
+~8 s/page and ~1 GB RAM for OCR vs milliseconds for text extraction, so
+the engine routes per page and caches everything.
 
-## Pipeline
-
-```
-PDF (pymupdf, lazy page rendering, 200 DPI)
-  → OCR (RapidOCR, PP-OCRv5 Arabic mobile, ONNX Runtime)
-  → blocks        raw boxes + text + confidence + coordinates
-  → lines         vertical-overlap grouping, RTL block ordering
-  → reading order single/two-column detection (right column first)
-  → regions       title / heading / body / special / noise + paragraphs
-  → page cleanup  headers/footers/watermarks, decorative marks, letter-spam
-  → normalize     careful Persian normalization (never destroys content)
-  → chunks        heading sections, sentence-boundary splits, full metadata
-```
-
-## Modules (`src/`)
+## Package layout (`src/darsio_ingest/`)
 
 | Module | Responsibility |
 |---|---|
-| `pdf.py` | rendering (lazy per-page), metadata, stable document ids |
-| `ocr.py` | RapidOCR engine wrapper, in-memory images, block extraction |
-| `preprocessing.py` | optional grayscale/contrast/sharpen (off by default — A/B tested slower *and* worse) |
-| `layout.py` | line grouping, columns/reading order, classification, repeated-content removal, page assembly |
-| `normalize.py` | Persian letter folding, diacritics, digits, punctuation, ZWNJ-aware |
-| `chunking.py` | structure-aware chunker with page-boundary policy |
-| `models.py` | OCRBlock / OCRLine / TextRegion / PageResult / Chunk / DocumentResult |
-| `pipeline.py` | orchestration + per-page timings |
-| `cli.py` | command-line entrypoint, writes JSON / JSONL / TXT / bench |
-| `debug_page.py` | raw OCR + classification diagnostics for one page |
-| `test_other_docs.py` | generalization check on other PDFs |
+| `diagnose.py` | page + document classification (text_ok / text_plus_visual / text_broken / scanned / empty), no OCR |
+| `extract.py` | text-layer path: pymupdf dict extraction into the same layout pipeline (no OCR) |
+| `ocr/` | RapidOCR engine wrapper (process-wide singleton, models load once) + optional preprocessing (off by default, A/B-tested worse) |
+| `layout.py` | line grouping, RTL order, columns, regions, header/footer/watermark stripping |
+| `normalize/` | conservative Persian normalization (presentation forms, ZWNJ-aware, digits, punctuation) |
+| `chunking.py` | structure-aware chunker, page-boundary policy, full RAG metadata |
+| `pipeline.py` | dual-path routing, page cache integration, process_pages / process_document / run_ingest_job |
+| `cache.py` | PageCache protocol (Darsio wraps it with its DB) + in-memory impl |
+| `prompts/` | build_messages + pack_context for normal / exam / research modes |
+| `api_types.py` | stable contract types: IngestJob, IngestJobResult, ProcessOptions, CachedPage, PageStatus, ENGINE_VERSION |
+| `pdfio.py` | lazy rendering, checksums, document ids |
+| `retrieval.py` | lexical IDF retriever (baseline; drop-in interface for embeddings) |
+| `cli.py` | `darsio-ingest diagnose / process / bench` (debugging tool) |
 
-## Usage
+How the engine decides, end-to-end, with Darsio integration examples:
+see [ENGINE.md](ENGINE.md).
+
+## Quick start
 
 ```bash
-# Full document (13 pages of the benchmark PDF)
-uv run python src/cli.py data/input/test.pdf --outdir data/output/run
+uv sync --group dev
+uv run pytest tests/ -q        # 57 tests, no OCR models needed
 
-# Selected pages only (fast iteration)
-uv run python src/cli.py data/input/test.pdf --pages 7 --outdir data/output/p7
+# What kind of pages does this PDF have? (no OCR, milliseconds)
+uv run darsio-ingest diagnose "data/input/Gilan-College-Pamphelt.pdf"
 
-# Different DPI, keep headers/footers, keep noise blocks in JSON
-uv run python src/cli.py data/input/test.pdf --dpi 300 \
-    --no-strip-repeated --keep-noise --include-blocks
+# Process pages 1-5 only (auto: text path for healthy pages, OCR for scans)
+uv run darsio-ingest process "data/input/Gilan-College-Pamphelt.pdf" \
+    --pages 1-5 --outdir data/output/run
 
-# Generalization check on any other PDF
-uv run python src/test_other_docs.py "data/input/Gilan-College-Pamphelt.pdf" --pages 4,5
+# Force the OCR path (for scanned pamphlets)
+uv run darsio-ingest process data/input/test.pdf --pages 1-3 \
+    --mode ocr_only --outdir data/output/ocr
 
-# Single-page OCR/layout diagnostics
-uv run python src/debug_page.py data/input/test.pdf 7
+# Token/cost benchmark (no API calls)
+uv run darsio-ingest bench data/input/test.pdf --outdir data/output/bench
 ```
 
-Outputs in `--outdir`:
+Outputs under `--outdir`: `document.json`, `chunks.jsonl` (embed this),
+`document.txt`, `bench.json`, and for diagnose `diagnosis.json`.
 
-* `document.json` — full structure: metadata, pages, regions (bboxes, roles, scores), chunks
-* `chunks.jsonl` — one retrieval-ready chunk per line (embed this)
-* `document.txt` — human-readable per-page text
-* `bench.json` — timing summary + removed repeated texts
+## Using it from Darsio
 
-## Chunk metadata (per chunk)
+```python
+from darsio_ingest import (
+    diagnose_pdf, process_pages, build_messages, pack_context,
+    run_ingest_job, IngestJob, InMemoryPageCache,
+)
 
-`chunk_id`, `document_id`, `chunk_index`, `chunk_type`
-(paragraph/heading/special), `text`, `page_start`, `page_end`, `section`,
-`section_path`, `bbox` (union geometry), `score` (mean OCR confidence),
-`language`, `char_count` — everything needed for page-cited RAG.
+# 1) After upload: cheap classification (no OCR, no page decisions)
+d = diagnose_pdf("uploads/lecture.pdf")
+d.status_counts          # {"text_ok": 12, "scanned": 88, ...}
+d.pages_with_status("text_broken", "scanned")  # OCR candidates for quota
 
-## Benchmark (this machine, 13-page scanned PDF, 200 DPI)
+# 2) When the user asks about pages 40-52 (product/quota chose the range)
+job = IngestJob(document_id="lecture-abc", pdf_path="uploads/lecture.pdf",
+                pages=list(range(40, 53)), mode="auto", dpi=200)
+result = run_ingest_job(job, cache=InMemoryPageCache())  # swap in your DB cache
+result.pages_done, result.method_per_page, result.chunks
 
-| Stage | Time |
-|---|---|
-| Total pipeline | ~103 s (~7.9 s/page) |
-| OCR (RapidOCR PP-OCRv5 Arabic mobile) | ~98 s |
-| Layout + chunking + I/O | ~5 s |
+# 3) At answer time: build the study-mode prompt
+messages = build_messages(
+    question="چرا اوزون مهم است؟",
+    chunks=result.chunks[:6],
+    history=[{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}],
+    study_mode="exam",       # normal | exam | research
+)
+# -> OpenAI-style message dicts; call your LLM provider with them
+```
 
-RapidOCR was chosen over PaddleOCR after benchmarking: significantly faster
-on this machine at comparable quality. Do not swap engines without a
-documented A/B win.
-
-Example: `data/output/final/` contains the final run for `data/input/test.pdf`.
+The page cache is the only seam Darsio must implement: a `PageCache` with
+`get_page_text`, `get_cached_page`, `upsert_page_text` backed by its
+SQLAlchemy models. A page is a cache hit only when checksum, dpi, source
+method AND engine version all match, so re-running jobs is idempotent and
+engine upgrades self-invalidate stale pages. Full examples including the
+DB adapter: [ENGINE.md](ENGINE.md).
 
 ## Design decisions worth knowing
 
-* **Raw color images beat preprocessing** on the benchmark (A/B tested):
-  grayscale+contrast+sharpen destroyed a real content line and produced
+* **Raw color images beat preprocessing** (A/B tested): grayscale +
+  contrast + sharpen destroyed a real content line and produced
   letter-spam. Preprocessing stays available but off.
 * **Uncertain content is classified, not deleted**: low-score formula-like
   content is kept down to 0.30 confidence as SPECIAL; garbage-looking text
   (letter-spam, decorative marks, footer banners) is what gets removed.
 * **Repeated headers/footers/watermarks** are removed by cross-page text
-  repetition (≥60% of pages), never by fixed positions alone.
-* **RTL correctness**: only the *order of blocks* is mapped to reading
-  order (right→left); Persian strings themselves are never reversed.
-* **Page-boundary policy**: chunks don't span pages by default (slide-like
-  pamphlets); pass `merge_across_pages=True` in `chunk_regions` for flowing
+  repetition (>= 60% of pages), never by fixed positions alone.
+* **RTL correctness**: only the *order of boxes* is mapped to reading
+  order (right to left); Persian strings themselves are never reversed.
+* **Arabic presentation forms** (FB50-FDFF, FE70-FEFF) are folded to
+  standard Persian letters during normalization; diagnose counts them as
+  healthy Persian, not broken text.
+* **Page-boundary policy**: chunks don't span pages by default
+  (slide-like pamphlets); pass `merge_across_pages=True` for flowing
   textbooks, and `reset_sections_per_page=False` to keep section context.
 * **Normalization is conservative**: ZWNJ is meaningful and kept; Arabic
   letters fold to Persian; digits fold to ASCII; diacritics are stripped;
   nothing alphanumeric is ever deleted.
+* **RapidOCR over PaddleOCR** was a measured benchmark win on the
+  reference machine; PaddleOCR was removed from dependencies. Do not swap
+  engines without a documented A/B win.
+
+## Benchmarks (reference machine, 200 DPI)
+
+| Path | Speed | Notes |
+|---|---|---|
+| diagnose | ~ms / page | object-level only, no rendering |
+| text path | ~ms / page | healthy text layers |
+| OCR path | ~7.9 s / page | RapidOCR PP-OCRv5 Arabic mobile |
+| RAM peak (OCR) | ~1 GB | one page image at a time, models loaded once |
+
+RAG retrieval on the 13-page chemistry pamphlet (lexical retriever,
+k=4): 5/5 page hit-rate, ~80% input token reduction vs sending the full
+OCR text.
 
 ## Reference
 
